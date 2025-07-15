@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <title>Solaswap - تبادل العملات الرقمية</title>
+  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.js"></script>
+  <script src="https://unpkg.com/@solana/wallet-adapter-base@latest/lib/index.iife.min.js"></script>
+  <script src="https://unpkg.com/@solana/wallet-adapter-wallets@latest/lib/index.iife.min.js"></script>
+  <script src="https://unpkg.com/@solana/wallet-adapter-react-ui@latest/lib/index.iife.min.js"></script>
+  <style>
+    body {
+      background: #1e1e2f;
+      color: #fff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      padding: 20px;
+      max-width: 500px;
+      margin: auto;
+      text-align: center;
+    }
+    button, select, input {
+      padding: 10px;
+      margin: 10px 0;
+      width: 100%;
+      border-radius: 8px;
+      border: none;
+      font-size: 1em;
+    }
+    button {
+      background: #8a3ffc;
+      color: white;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    button:hover {
+      background: #5c1ecc;
+    }
+    select, input {
+      background: #2a2a4d;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+
+<h1>مرحبًا في Solaswap</h1>
+<p>ربط محفظتك وابدأ تبادل العملات الرقمية بسهولة.</p>
+
+<button id="connectWalletBtn">ربط المحفظة</button>
+
+<div id="walletAddress" style="margin: 10px 0; font-weight: bold;"></div>
+
+<label for="inputAmount">المبلغ المراد تبادله:</label>
+<input type="number" id="inputAmount" placeholder="أدخل المبلغ" min="0" step="any" />
+
+<label for="selectFrom">اختر العملة التي تريد تبديلها:</label>
+<select id="selectFrom"></select>
+
+<label for="selectTo">اختر العملة التي تريد الحصول عليها:</label>
+<select id="selectTo"></select>
+
+<button id="swapBtn" disabled>ابدأ التبادل</button>
+
+<div id="status" style="margin-top: 20px;"></div>
+
+<script>
+(async () => {
+  const { Connection, PublicKey, Transaction, clusterApiUrl } = solanaWeb3;
+  const network = "https://api.mainnet-beta.solana.com";
+  const connection = new Connection(network);
+
+  // Wallet adapter minimal
+  const wallets = [
+    new solanaWalletAdapterWallets.PhantomWalletAdapter(),
+    new solanaWalletAdapterWallets.SolflareWalletAdapter(),
+  ];
+
+  let wallet = wallets[0]; // Phantom as default
+  let connected = false;
+
+  const connectBtn = document.getElementById('connectWalletBtn');
+  const walletAddressDiv = document.getElementById('walletAddress');
+  const swapBtn = document.getElementById('swapBtn');
+  const inputAmount = document.getElementById('inputAmount');
+  const selectFrom = document.getElementById('selectFrom');
+  const selectTo = document.getElementById('selectTo');
+  const statusDiv = document.getElementById('status');
+
+  // Jupiter tokens endpoint
+  const tokensUrl = "https://cache.jup.ag/tokens";
+  let tokens = [];
+
+  async function fetchTokens() {
+    try {
+      const res = await fetch(tokensUrl);
+      tokens = await res.json();
+      fillTokenSelects();
+    } catch(e) {
+      statusDiv.textContent = "فشل تحميل العملات من Jupiter.";
+      console.error(e);
+    }
+  }
+
+  function fillTokenSelects() {
+    tokens.forEach(token => {
+      const optionFrom = document.createElement('option');
+      optionFrom.value = token.address;
+      optionFrom.textContent = `${token.symbol} - ${token.name}`;
+      selectFrom.appendChild(optionFrom);
+
+      const optionTo = document.createElement('option');
+      optionTo.value = token.address;
+      optionTo.textContent = `${token.symbol} - ${token.name}`;
+      selectTo.appendChild(optionTo);
+    });
+    // اختيار مبدئي
+    selectFrom.value = "So11111111111111111111111111111111111111112"; // SOL
+    selectTo.value = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+  }
+
+  async function connectWallet() {
+    try {
+      await wallet.connect();
+      connected = true;
+      walletAddressDiv.textContent = "محفظتك: " + wallet.publicKey.toBase58();
+      connectBtn.textContent = "تم الربط ✓";
+      connectBtn.disabled = true;
+      swapBtn.disabled = false;
+      statusDiv.textContent = "";
+    } catch (err) {
+      statusDiv.textContent = "فشل ربط المحفظة.";
+      console.error(err);
+    }
+  }
+
+  async function getSwapRoutes(amount, fromMint, toMint) {
+    // amount in uiAmount * 10^decimals, so convert to raw amount (bigint)
+    const fromToken = tokens.find(t => t.address === fromMint);
+    if (!fromToken) throw new Error("رمز العملة غير معروف");
+
+    const rawAmount = Math.floor(amount * Math.pow(10, fromToken.decimals));
+
+    // Call Jupiter quote API
+    const url = `https://quote-api.jup.ag/v4/quote?inputMint=${fromMint}&outputMint=${toMint}&amount=${rawAmount}&slippage=1&onlyDirectRoutes=false&swapMode=ExactIn`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("فشل جلب الاقتباسات من Jupiter");
+    const data = await res.json();
+
+    if (!data.data || data.data.length === 0) throw new Error("لا توجد طرق تبادل متاحة");
+
+    return data.data[0]; // أفضل طريق
+  }
+
+  async function performSwap(route) {
+    if (!connected) {
+      statusDiv.textContent = "يرجى ربط المحفظة أولاً.";
+      return;
+    }
+    try {
+      // نطلب من Jupiter الصفقة كاملة
+      const txUrl = `https://quote-api.jup.ag/v4/swap`;
+
+      const swapPayload = {
+        route: route,
+        userPublicKey: wallet.publicKey.toBase58()
+      };
+
+      const swapRes = await fetch(txUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(swapPayload),
+      });
+
+      if (!swapRes.ok) throw new Error("فشل إنشاء صفقة التبادل");
+
+      const swapData = await swapRes.json();
+
+      if (!swapData.swapTransaction) throw new Error("لم يتم الحصول على معاملة التبادل");
+
+      // فك ترميز المعاملة base64
+      const rawTx = Buffer.from(swapData.swapTransaction, 'base64');
+
+      // نقل المعاملة للمحفظة لتوقيعها
+      const transaction = Transaction.from(rawTx);
+
+      const signedTx = await wallet.signTransaction(transaction);
+
+      const txid = await connection.sendRawTransaction(signedTx.serialize());
+
+      statusDiv.innerHTML = `تم إرسال الصفقة بنجاح. <br> معرف المعاملة: <a href="https://solscan.io/tx/${txid}" target="_blank" style="color:#8a3ffc;">${txid}</a>`;
+
+      // تأكيد المعاملة
+      await connection.confirmTransaction(txid);
+
+    } catch (err) {
+      console.error(err);
+      statusDiv.textContent = "حدث خطأ أثناء تنفيذ التبادل: " + err.message;
+    }
+  }
+
+  // Events
+  connectBtn.addEventListener('click', connectWallet);
+  swapBtn.addEventListener('click', async () => {
+    statusDiv.textContent = "جاري البحث عن أفضل طريق للتبادل...";
+    const amount = parseFloat(inputAmount.value);
+    if (isNaN(amount) || amount <= 0) {
+      statusDiv.textContent = "يرجى إدخال مبلغ صحيح أكبر من صفر.";
+      return;
+    }
+    try {
+      const route = await getSwapRoutes(amount, selectFrom.value, selectTo.value);
+      await performSwap(route);
+    } catch (err) {
+      statusDiv.textContent = "خطأ: " + err.message;
+    }
+  });
+
+  await fetchTokens();
+})();
+</script>
+
+</body>
+</html>
